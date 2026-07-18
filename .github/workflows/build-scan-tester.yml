@@ -1,0 +1,150 @@
+# This is a basic workflow to help you get started with Actions
+
+name: Build Scan Tester
+
+on:
+  release:
+    types: [published, prereleased]
+
+  workflow_dispatch:
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+
+  apiiro-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    # Define it once here for the entire job
+    env:
+      APIIRO_BEARER_TOKEN: ${{ secrets.APIIRO_BEARER_TOKEN }}
+  
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+  
+      - name: Prepare Payload
+        run: |
+          echo "PAYLOAD<<EOF" >> $GITHUB_ENV
+          cat <<EOF >> $GITHUB_ENV
+          {
+            "branch": "${{ github.ref_name }}",
+            "buildJob": {
+              "id": "${{ github.run_id }}",
+              "cicdServerUrl": "${{ github.server_url }}/${{ github.repository }}",
+              "pipelineId": "${{ github.workflow }}",
+              "pipelineName": "${{ github.workflow }}",
+              "cicdProviderType": "GitHub Actions"
+            },
+            "commitSha": "${{ github.sha }}",
+            "repositoryUrl": "${{ github.server_url }}/${{ github.repository }}"
+          }
+          EOF
+          echo "EOF" >> $GITHUB_ENV
+  
+      - name: Apiiro create build scan (best-effort)
+        run: |
+          set -euo pipefail
+
+          # Parameterized version:
+          APIIRO_BEARER_TOKEN="${{ secrets.APIIRO_BEARER_TOKEN }}"
+          echo "::add-mask::$APIIRO_BEARER_TOKEN"
+          HOST="${{ vars.APIIRO_HOST }}"
+          echo "HOST: $HOST"
+          http_code="$(
+            curl --location "https://$HOST/rest-api/v1/buildScan/builds" \
+              --silent --show-error \
+              --output response.json \
+              --write-out "%{http_code}" \
+              --header "Content-Type: application/json" \
+              --header "Authorization: Bearer $APIIRO_BEARER_TOKEN" \
+              --insecure \
+              --data "$PAYLOAD" || true
+          )"
+          echo "Apiiro create build scan HTTP status: $http_code"
+          echo "Apiiro create build scan response body (response.json):"
+          cat response.json || true
+
+          if [[ "$http_code" == "200" ]]; then
+            {
+              echo "buildID<<__APIIRO_BUILDID__"
+              cat response.json
+              echo
+              echo "__APIIRO_BUILDID__"
+            } >> "$GITHUB_ENV"
+          fi
+  
+      - name: Apiiro fetch build scan results (best-effort)
+        run: |
+          set -euo pipefail
+
+          max_attempts=50
+          attempt=1
+          sleep_seconds=30
+
+          got_200=false
+
+          while [[ "$attempt" -le "$max_attempts" ]]; do
+            APIIRO_BEARER_TOKEN="${{ secrets.APIIRO_BEARER_TOKEN }}"
+            echo "::add-mask::$APIIRO_BEARER_TOKEN"
+            HOST="${{ vars.APIIRO_HOST }}"
+            echo "HOST: $HOST"
+            http_code="$(
+              curl --location "https://$HOST/rest-api/v2/buildScan/${buildID}/results" \
+                --silent --show-error \
+                --output results.json \
+                --write-out "%{http_code}" \
+                --insecure \
+                --header "Authorization: Bearer $APIIRO_BEARER_TOKEN" || true
+            )"
+
+            echo "Apiiro fetch results HTTP status: $http_code (attempt ${attempt}/${max_attempts})"
+
+            if [[ "$http_code" == "200" ]]; then
+              got_200=true
+              break
+            fi
+
+            if [[ "$http_code" == "503" ]]; then
+              echo "Received 503; retrying in ${sleep_seconds}s..."
+              sleep "$sleep_seconds"
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            attempt=$((attempt + 1))
+            sleep "$sleep_seconds"
+          done
+
+          if [[ "$got_200" != "true" ]]; then
+            echo "Failed to fetch results after ${max_attempts} attempts (never received HTTP 200)."
+            echo "Last response body (results.json):"
+            cat results.json || true
+            exit 1
+          fi
+
+          echo "Apiiro fetch results response body (results.json):"
+          cat results.json || true
+
+          if grep -Eq '"buildPassed"[[:space:]]*:[[:space:]]*false' results.json; then
+            echo "Apiiro scan reported buildPassed=false"
+            exit 1
+          fi
+
+          if grep -Eq '"buildPassed"[[:space:]]*:[[:space:]]*true' results.json; then
+            echo "Apiiro scan reported buildPassed=true"
+            exit 0
+          fi
+
+          echo "Could not determine buildPassed from results.json (missing true/false match)"
+          exit 1
+
